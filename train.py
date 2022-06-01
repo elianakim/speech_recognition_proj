@@ -150,7 +150,7 @@ class SpeechRecognitionModel(nn.Module):
         ## define the fully connected layer
         self.classifier = nn.Linear(512,n_classes)
 
-        self.preprocess   = torchaudio.transforms.MFCC(sample_rate=8000, n_mfcc=40)
+        self.preprocess   = torchaudio.transforms.MFCC(sample_rate=16000, n_mfcc=40)
         self.instancenorm = nn.InstanceNorm1d(40)
 
     def forward(self, x):
