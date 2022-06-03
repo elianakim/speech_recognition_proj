@@ -48,4 +48,4 @@ When you are done with the project, send me an email with the following in one z
 
 - Your code (`.py`)
 - JSON file with the test set output (`.json`)
-- A short report summarizing what you have done. Keep it at less than one page at font 14. (`.txt`)
+- A short report summarizing what you have done. Keep it at less than one page at font 14. (`.pdf`)
