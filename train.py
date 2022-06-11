@@ -1,4 +1,4 @@
-#-*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 import os
 import json
@@ -15,6 +15,8 @@ import pickle
 from flask import Flask, request
 from tqdm import tqdm
 
+device=None
+
 ## ===================================================================
 ## Load labels
 ## ===================================================================
@@ -28,8 +30,9 @@ def load_label_json(labels_path):
         for index, char in enumerate(labels):
             char2index[char] = index
             index2char[index] = char
-            
+
         return char2index, index2char
+
 
 ## ===================================================================
 ## Data loader
@@ -40,7 +43,7 @@ class SpeechDataset(torch.utils.data.Dataset):
         super(SpeechDataset, self).__init__()
 
         # load data from JSON
-        with open(data_list,'r') as f:
+        with open(data_list, 'r') as f:
             data = json.load(f)
 
         # convert seconds to frames
@@ -50,14 +53,15 @@ class SpeechDataset(torch.utils.data.Dataset):
         data = sorted(data, key=lambda d: d['len'], reverse=True)
         self.data = [x for x in data if x['len'] <= max_length]
 
-        self.dataset_path   = data_path
-        self.char2index     = char2index
+        self.dataset_path = data_path
+        self.char2index = char2index
 
     def __getitem__(self, index):
-
         # read audio using soundfile.read
         # < fill your code here >
-        
+        data_path = os.path.join(self.dataset_path, self.data[index]['file'])
+        audio = soundfile.read(data_path)[0]
+
         # read transcript and convert to indices
         transcript = self.data[index]['text']
         transcript = self.parse_transcript(transcript)
@@ -80,14 +84,15 @@ def pad_collate(batch):
     (xx, yy) = zip(*batch)
 
     ## compute lengths of each item in xx and yy
-    x_lens = # < fill your code here >
-    y_lens = # < fill your code here >
+    x_lens = [len(x) for x in xx]  # < fill your code here >
+    y_lens = [len(y) for y in yy]  # < fill your code here >
 
     ## zero-pad to the longest length
-    xx_pad = # < fill your code here >
-    yy_pad = # < fill your code here >
+    xx_pad = torch.nn.utils.rnn.pad_sequence(xx, batch_first=True, padding_value=0)  # < fill your code here >
+    yy_pad = torch.nn.utils.rnn.pad_sequence(yy, batch_first=True, padding_value=0)  # < fill your code here >
 
     return xx_pad, yy_pad, x_lens, y_lens
+
 
 ## ===================================================================
 ## Define sampler 
@@ -104,7 +109,6 @@ class BucketingSampler(torch.utils.data.sampler.Sampler):
         self.bins = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
 
     def __iter__(self):
-
         # Shuffle bins in random order
         np.random.shuffle(self.bins)
 
@@ -117,6 +121,7 @@ class BucketingSampler(torch.utils.data.sampler.Sampler):
     def __len__(self):
         return len(self.bins)
 
+
 ## ===================================================================
 ## Baseline speech recognition model
 ## ===================================================================
@@ -125,93 +130,113 @@ class SpeechRecognitionModel(nn.Module):
 
     def __init__(self, n_classes=11):
         super(SpeechRecognitionModel, self).__init__()
-        
-        cnns = [nn.Dropout(0.1),  
-                nn.Conv1d(40,64,3, stride=1, padding=1),
+
+        cnns = [nn.Dropout(0.1),
+                nn.Conv1d(40, 64, 3, stride=1, padding=1),
                 nn.BatchNorm1d(64),
                 nn.ReLU(),
-                nn.Dropout(0.1),  
-                nn.Conv1d(64,64,3, stride=1, padding=1),
+                nn.Dropout(0.1),
+                nn.Conv1d(64, 64, 3, stride=1, padding=1),
                 nn.BatchNorm1d(64),
-                nn.ReLU()] 
+                nn.ReLU()]
 
         for i in range(2):
-          cnns += [nn.Dropout(0.1),  
-                   nn.Conv1d(64,64, 3, stride=1, padding=1),
-                   nn.BatchNorm1d(64),
-                   nn.ReLU()]
+            cnns += [nn.Dropout(0.1),
+                     nn.Conv1d(64, 64, 3, stride=1, padding=1),
+                     nn.BatchNorm1d(64),
+                     nn.ReLU()]
 
         ## define CNN layers
         self.cnns = nn.Sequential(*nn.ModuleList(cnns))
 
-        ## define RNN layers as self.lstm - use a 3-layer bidirectional LSTM with 128 output size and 0.1 dropout
+        ## define RNN layers as self.lstm - use a 3-layer bidirectional LSTM with 256 output size and 0.1 dropout
         # < fill your code here >
+        self.lstm = torch.nn.LSTM(input_size=64, hidden_size=256, dropout=0.1, num_layers=3, bidirectional=True)
+
+        self.transformer = torch.nn.Transformer(d_model = 40, nhead=8, num_encoder_layers=6,
+                                                dim_feedforward=512, dropout=0.1, activation="relu",
+                                                batch_first=True)
 
         ## define the fully connected layer
-        self.classifier = nn.Linear(512,n_classes)
+        self.classifier = nn.Linear(512, n_classes)
 
-        self.preprocess   = torchaudio.transforms.MFCC(sample_rate=16000, n_mfcc=40)
+        self.preprocess = torchaudio.transforms.MFCC(sample_rate=16000, n_mfcc=40)
         self.instancenorm = nn.InstanceNorm1d(40)
 
     def forward(self, x):
-
         ## compute MFCC and perform mean variance normalisation
         with torch.no_grad():
-          x = self.preprocess(x)+1e-6
-          x = self.instancenorm(x).detach()
+            x = self.preprocess(x) + 1e-6
+            x = self.instancenorm(x).detach()
 
         ## pass the network through the CNN layers
         # < fill your code here >
+        cnn_out = self.cnns(x)
 
         ## pass the network through the RNN layers - check the input dimensions of nn.LSTM()
         # < fill your code here >
+        lstm_out = self.lstm(cnn_out.transpose(1, 2))[0]
 
         ## pass the network through the classifier
         # < fill your code here >
+        class_out = self.classifier(lstm_out)
 
-        return x
+        return class_out
+
 
 ## ===================================================================
 ## Train an epoch on GPU
 ## ===================================================================
 
-def process_epoch(model,loader,criterion,optimizer,trainmode=True):
-
+def process_epoch(model, loader, criterion, optimizer, trainmode=True):
     # Set the model to training or eval mode
     if trainmode:
         # < fill your code here >
+        model.train()
     else:
         # < fill your code here >
+        model.eval()
 
     ep_loss = 0
-    ep_cnt  = 0
+    ep_cnt = 0
 
     with tqdm(loader, unit="batch") as tepoch:
-
         for data in tepoch:
-
             ## Load x and y
             x = data[0].cuda()
             y = data[1].cuda()
-            y_len = torch.LongTensor(data[3])
+            y_len = torch.LongTensor(data[3]).cuda()
 
             # < fill your code here >
+            # add some noise to x
+            x = x + torch.normal(mean=0, std=torch.std(x) * 1e-3, size=x.shape).cuda()
+
+            # forward pass
+            logits = model.forward(x)
+            output = torch.nn.functional.log_softmax(logits, 2)
+            output = output.transpose(0, 1)
 
             ## compute the loss using the CTC objective
             x_len = torch.LongTensor([output.size(0)]).repeat(output.size(1))
             loss = criterion(output, y, x_len, y_len)
 
             if trainmode:
-              # < fill your code here >
+                # < fill your code here >
+                # backward pass
+                loss.backward()
+
+                # optimizer step
+                optimizer.step()
+                optimizer.zero_grad()
 
             # keep running average of loss
             ep_loss += loss.detach() * len(x)
-            ep_cnt  += len(x)
+            ep_cnt += len(x)
 
             # print value to TQDM
-            tepoch.set_postfix(loss=ep_loss.item()/ep_cnt)
+            tepoch.set_postfix(loss=ep_loss.item() / ep_cnt)
 
-    return ep_loss.item()/ep_cnt
+    return ep_loss.item() / ep_cnt
 
 
 ## ===================================================================
@@ -227,8 +252,19 @@ class GreedyCTCDecoder(torch.nn.Module):
         """
         Given a sequence emission over labels, get the best path.
         """
-        
+
         # < fill your code here >
+        # find the index of the maximum probability output at each time step
+        max_prob = torch.argmax(emission, dim=-1)
+
+        # remove the repeats
+        removed_repeats = torch.unique_consecutive(max_prob, dim=-1)
+
+        # convert to numpy array
+        removed_repeats = removed_repeats.cpu().numpy()
+
+        # remove the blank symbols
+        indices = removed_repeats[removed_repeats != self.blank]
 
         return indices
 
@@ -237,8 +273,7 @@ class GreedyCTCDecoder(torch.nn.Module):
 ## Evaluation script
 ## ===================================================================
 
-def process_eval(model,data_path,data_list,index2char,save_path=None):
-
+def process_eval(model, data_path, data_list, index2char, save_path=None):
     # set model to evaluation mode
     model.eval()
 
@@ -246,7 +281,7 @@ def process_eval(model,data_path,data_list,index2char,save_path=None):
     greedy_decoder = GreedyCTCDecoder(blank=len(index2char))
 
     # load data from JSON
-    with open(data_list,'r') as f:
+    with open(data_list, 'r') as f:
         data = json.load(f)
 
     results = []
@@ -256,12 +291,19 @@ def process_eval(model,data_path,data_list,index2char,save_path=None):
         # read the wav file and convert to PyTorch format
         audio, sample_rate = soundfile.read(os.path.join(data_path, file['file']))
         # < fill your code here >
+        x = torch.FloatTensor(audio).cuda()
+        x = x.unsqueeze(dim=0)
 
         # forward pass through the model
         # < fill your code here >
+        with torch.no_grad():
+            logits = model.forward(x)
+            pred = torch.nn.functional.log_softmax(torch.permute(logits, (1, 0, 2)), 2)
+            pred = pred[:, 0, :]
 
         # decode using the greedy decoder
         # < fill your code here >
+        pred = greedy_decoder.forward(pred)
 
         # convert to text
         out_text = ''.join([index2char[x] for x in pred])
@@ -269,26 +311,25 @@ def process_eval(model,data_path,data_list,index2char,save_path=None):
         # keep log of the results
         file['pred'] = out_text
         if 'text' in file:
-            file['edit_dist']   = editdistance.eval(out_text.replace(' ',''),file['text'].replace(' ',''))
-            file['gt_len']     = len(file['text'].replace(' ',''))
+            file['edit_dist'] = editdistance.eval(out_text.replace(' ', ''), file['text'].replace(' ', ''))
+            file['gt_len'] = len(file['text'].replace(' ', ''))
         results.append(file)
-    
+
     # save results to json file
-    with open(os.path.join(save_path,'results.json'), 'w', encoding='utf-8') as outfile:
+    with open(os.path.join(save_path, 'results.json'), 'w', encoding='utf-8') as outfile:
         json.dump(results, outfile, ensure_ascii=False, indent=2)
 
     # print CER if there is ground truth
     if 'text' in file:
         cer = sum([x['edit_dist'] for x in results]) / sum([x['gt_len'] for x in results])
-        print('Character Error Rate is {:.2f}%'.format(cer*100))
+        print('Character Error Rate is {:.2f}%'.format(cer * 100))
 
 
 ## ===================================================================
 ## Deploy server script
 ## ===================================================================
 
-def deploy_server(model,index2char,port):
-
+def deploy_server(model, index2char, port):
     # initialise the greedy decoder
     greedy_decoder = GreedyCTCDecoder(blank=len(index2char))
 
@@ -297,15 +338,19 @@ def deploy_server(model,index2char,port):
 
     @app.route('/query-window', methods=['POST'])
     def process_chunk():
-
         # unpack the received data
         data = pickle.loads(request.get_data())
 
         # convert to PyTorch format
         # < fill your code here >
-        
+        data = torch.FloatTensor(data).cuda()
+
         # forward pass through the model
         # < fill your code here >
+        with torch.no_grad():
+            logits = model.forward(data)
+            pred = torch.nn.functional.log_softmax(torch.permute(logits, (1, 0, 2)), 2)
+            output = pred[:, 0, :]
 
         # decode using the greedy decoder
         pred = greedy_decoder(output.cpu().detach().squeeze())
@@ -313,7 +358,7 @@ def deploy_server(model,index2char,port):
         # join the index
         out_text = ''.join([index2char[x] for x in pred])
 
-        print('Result:',out_text)
+        print('Result:', out_text)
 
         return out_text
 
@@ -324,40 +369,48 @@ def deploy_server(model,index2char,port):
 ## ===================================================================
 
 def main():
-
     parser = argparse.ArgumentParser(description='EE738 Exercise')
 
+    ## gpu configuration
+    parser.add_argument('--gpu_idx', type=int, default=0, help='index of gpu to use')
+
     ## related to data loading
-    parser.add_argument('--max_length', type=int, default=10,   help='maximum length of audio file in seconds')
-    parser.add_argument('--train_list', type=str, default='data/cc_train.json')
-    parser.add_argument('--val_list',   type=str, default='data/cc_val.json')
-    parser.add_argument('--train_path', type=str, default='/datasets/clovacall/wavs_train')
-    parser.add_argument('--val_path',   type=str, default='/datasets/clovacall/wavs_train')
-    parser.add_argument('--labels_path',   type=str, default='data/label.json')
+    parser.add_argument('--max_length', type=int, default=10, help='maximum length of audio file in seconds')
+    parser.add_argument('--train_list', type=str, default='./datasets/clovacall/cc_train.json')
+    parser.add_argument('--val_list', type=str, default='./datasets/clovacall/cc_val.json')
+    parser.add_argument('--train_path', type=str, default='./datasets/clovacall/wavs_train')
+    parser.add_argument('--val_path', type=str, default='./datasets/clovacall/wavs_train')
+    parser.add_argument('--labels_path', type=str, default='./datasets/char_dict/label.json')
 
     ## related to training
-    parser.add_argument('--max_epoch',  type=int, default=10,       help='number of epochs during training')
-    parser.add_argument('--batch_size', type=int, default=100,      help='batch size')
-    parser.add_argument('--lr',         type=int, default=1e-4,     help='learning rate')
-    parser.add_argument('--seed',       type=int, default=2222,     help='random seed initialisation')
-    
+    parser.add_argument('--max_epoch', type=int, default=10, help='number of epochs during training')
+    parser.add_argument('--batch_size', type=int, default=100, help='batch size')
+    parser.add_argument('--lr', type=int, default=1e-4, help='learning rate')
+    parser.add_argument('--seed', type=int, default=2222, help='random seed initialisation')
+
     ## relating to loading and saving
-    parser.add_argument('--initial_model',  type=str, default='',   help='load initial model, e.g. for finetuning')
-    parser.add_argument('--save_path',      type=str, default='',   help='location to save checkpoints')
+    parser.add_argument('--initial_model', type=str, default='', help='load initial model, e.g. for finetuning')
+    parser.add_argument('--save_path', type=str, default='./checkpoints', help='location to save checkpoints')
+    parser.add_argument('--log_suffix', type=str, default='debug', help='suffix used for logging data and models')
 
     ## related to inference and deploying server
-    parser.add_argument('--eval',   dest='eval',    action='store_true', help='Evaluation mode')
-    parser.add_argument('--server', dest='server',  action='store_true', help='Server mode')
-    parser.add_argument('--port',   type=int,       default=10000,       help='Port for the server')
+    parser.add_argument('--eval', dest='eval', action='store_true', help='Evaluation mode')
+    parser.add_argument('--server', dest='server', action='store_true', help='Server mode')
+    parser.add_argument('--port', type=int, default=10000, help='Port for the server')
 
     args = parser.parse_args()
+
+    # device configuration
+    device = torch.device("cuda:{:d}".format(args.gpu_idx) if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(args.gpu_idx) # prevents unnecessary gpu memory allocation to cuda:0
+    print(device)
 
     # load labels
     char2index, index2char = load_label_json(args.labels_path)
 
     ## make an instance of the model on GPU
-    model = SpeechRecognitionModel(n_classes=len(char2index)+1).cuda()
-    print('Model loaded. Number of parameters:',sum(p.numel() for p in model.parameters()))
+    model = SpeechRecognitionModel(n_classes=len(char2index) + 1).cuda()
+    print('Model loaded. Number of parameters:', sum(p.numel() for p in model.parameters()))
 
     ## load from initial model
     if args.initial_model != '':
@@ -365,16 +418,18 @@ def main():
 
     ## code for server
     if args.server:
-        deploy_server(model,index2char,args.port)
+        deploy_server(model, index2char, args.port)
         quit();
 
     # make directory for saving models and output
     assert args.save_path != ''
-    os.makedirs(args.save_path,exist_ok=True)
+    assert args.log_suffix != ''
+    args.log_path = os.path.join(args.save_path, args.log_suffix)
+    os.makedirs(args.log_path, exist_ok=True)
 
     ## code for inference - this uses val_path and val_list
     if args.eval:
-        process_eval(model, args.val_path, args.val_list, index2char, save_path=args.save_path)
+        process_eval(model, args.val_path, args.val_list, index2char, save_path=args.log_path)
         quit();
 
     # initialise seeds
@@ -383,40 +438,51 @@ def main():
     np.random.seed(args.seed)
 
     # define datasets
-    trainset  = SpeechDataset(args.train_list, args.train_path, args.max_length, char2index)
-    valset    = SpeechDataset(args.val_list,   args.val_path,   args.max_length, char2index)
+    trainset = SpeechDataset(args.train_list, args.train_path, args.max_length, char2index)
+    valset = SpeechDataset(args.val_list, args.val_path, args.max_length, char2index)
 
     # initiate loader for each dataset with 'collate_fn' argument
     # do not use more than 6 workers
-    trainloader = torch.utils.data.DataLoader(trainset, 
-        batch_sampler=BucketingSampler(trainset, args.batch_size), 
-        num_workers=6, 
-        collate_fn=pad_collate)
-    valloader   = torch.utils.data.DataLoader(valset,   
-        batch_sampler=BucketingSampler(valset, args.batch_size), 
-        num_workers=6, 
-        collate_fn=pad_collate)
+    trainloader = torch.utils.data.DataLoader(trainset,
+                                              batch_sampler=BucketingSampler(trainset, args.batch_size),
+                                              num_workers=6,
+                                              collate_fn=pad_collate)
+    valloader = torch.utils.data.DataLoader(valset,
+                                            batch_sampler=BucketingSampler(valset, args.batch_size),
+                                            num_workers=6,
+                                            collate_fn=pad_collate)
 
     ## define the optimizer with args.lr learning rate and appropriate weight decay
     # < fill your code here >
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
 
     ## set loss function with blank index
     # < fill your code here >
+    criterion = torch.nn.CTCLoss(blank=10).cuda()
 
     ## initialise training log file
-    f_log = open(os.path.join(args.save_path,'train.log'),'w')
+    f_log = open(os.path.join(args.log_path, 'train.log'), 'w')
     f_log.write('{}\n'.format(args))
     f_log.flush()
 
+    cer_prev = None
     ## Train for args.max_epoch epochs
     for epoch in range(0, args.max_epoch):
-
         # < fill your code here >
+        print('Training epoch', epoch)
+        tloss = process_epoch(model, trainloader, criterion, optimizer, trainmode=True)
+        print('Trained epoch', epoch, 'Loss', tloss)
+
+        print('Validating epoch', epoch)
+        vloss = process_epoch(model, valloader, criterion, optimizer, trainmode=False)
+        print('Validated epoch', epoch, 'Loss', vloss)
 
         # save checkpoint to file
-        save_file = '{}/model{:05d}.pt'.format(args.save_path,epoch)
-        print('Saving model {}'.format(save_file))
-        torch.save(model.state_dict(), save_file)
+        # save at the last epoch
+        if epoch == args.max_epoch - 1:
+            save_file = '{}/model{:05d}.pt'.format(args.log_path, epoch)
+            print('Saving model {}'.format(save_file))
+            torch.save(model.state_dict(), save_file)
 
         # write training progress to log
         f_log.write('Epoch {:03d}, train loss {:.3f}, val loss {:.3f}\n'.format(epoch, tloss, vloss))
