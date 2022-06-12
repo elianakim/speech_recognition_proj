@@ -5,6 +5,7 @@ import json
 import pdb
 import argparse
 import time
+import math
 import torch
 import torch.nn as nn
 import torchaudio
@@ -14,6 +15,8 @@ import editdistance
 import pickle
 from flask import Flask, request
 from tqdm import tqdm
+
+from torch.nn import Transformer, TransformerEncoder, TransformerEncoderLayer
 
 device=None
 
@@ -121,6 +124,83 @@ class BucketingSampler(torch.utils.data.sampler.Sampler):
     def __len__(self):
         return len(self.bins)
 
+## ===================================================================
+## Transformer-related functions and classes
+## reference: https://pytorch.org/tutorials/beginner/transformer_tutorial.html
+## ===================================================================
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model, dropout = 0.1, max_len = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+class TransformerModel(nn.Module):
+
+    def __init__(self, ntoken, d_model, nhead, d_hid, nlayers, dropout):
+        super().__init__()
+
+        cnns = [nn.Dropout(0.1),
+                nn.Conv1d(40, 64, 3, stride=1, padding=1),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Conv1d(64, 64, 3, stride=1, padding=1),
+                nn.BatchNorm1d(64),
+                nn.ReLU()]
+
+        for i in range(2):
+            cnns += [nn.Dropout(0.1),
+                     nn.Conv1d(64, 64, 3, stride=1, padding=1),
+                     nn.BatchNorm1d(64),
+                     nn.ReLU()]
+
+        # define CNN layers
+        self.cnns = nn.Sequential(*nn.ModuleList(cnns))
+
+        # define transformer
+        self.model_type = 'Transformer'
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        encoder_layers = TransformerEncoderLayer(d_model, nhead, d_hid, dropout, batch_first=True)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        self.d_model = d_model
+        self.decoder = nn.Linear(d_model, ntoken)
+
+        self.preprocess = torchaudio.transforms.MFCC(sample_rate=16000, n_mfcc=40)
+        self.instancenorm = nn.InstanceNorm1d(40)
+
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.1
+        self.decoder.bias.data.zero_()
+        self.decoder.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, x):
+        # compute MFCC and perform mean variance normalisation
+        with torch.no_grad():
+            x = self.preprocess(x) + 1e-6
+            x = self.instancenorm(x).detach()
+
+        cnn_out = self.cnns(x).transpose(1, 2) # (batch, seq, feature)
+        cnn_out = cnn_out.long() * math.sqrt(self.d_model)
+
+        # src = self.encoder(cnn_out) * math.sqrt(self.d_model)
+        pos_out = self.pos_encoder(cnn_out)
+        encoded = self.transformer_encoder(pos_out)
+        output = self.decoder(encoded)
+
+        return output
 
 ## ===================================================================
 ## Baseline speech recognition model
@@ -153,10 +233,6 @@ class SpeechRecognitionModel(nn.Module):
         # < fill your code here >
         self.lstm = torch.nn.LSTM(input_size=64, hidden_size=256, dropout=0.1, num_layers=3, bidirectional=True)
 
-        self.transformer = torch.nn.Transformer(d_model = 40, nhead=8, num_encoder_layers=6,
-                                                dim_feedforward=512, dropout=0.1, activation="relu",
-                                                batch_first=True)
-
         ## define the fully connected layer
         self.classifier = nn.Linear(512, n_classes)
 
@@ -170,6 +246,7 @@ class SpeechRecognitionModel(nn.Module):
             x = self.instancenorm(x).detach()
 
         ## pass the network through the CNN layers
+
         # < fill your code here >
         cnn_out = self.cnns(x)
 
@@ -197,6 +274,8 @@ def process_epoch(model, loader, criterion, optimizer, trainmode=True):
         # < fill your code here >
         model.eval()
 
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
+
     ep_loss = 0
     ep_cnt = 0
 
@@ -213,7 +292,7 @@ def process_epoch(model, loader, criterion, optimizer, trainmode=True):
 
             # forward pass
             logits = model.forward(x)
-            output = torch.nn.functional.log_softmax(logits, 2)
+            output = torch.nn.functional.log_softmax(logits, dim=2)
             output = output.transpose(0, 1)
 
             ## compute the loss using the CTC objective
@@ -226,8 +305,10 @@ def process_epoch(model, loader, criterion, optimizer, trainmode=True):
                 loss.backward()
 
                 # optimizer step
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) # prevent gradient exploding
                 optimizer.step()
                 optimizer.zero_grad()
+                # scheduler.step()
 
             # keep running average of loss
             ep_loss += loss.detach() * len(x)
@@ -298,12 +379,13 @@ def process_eval(model, data_path, data_list, index2char, save_path=None):
         # < fill your code here >
         with torch.no_grad():
             logits = model.forward(x)
-            pred = torch.nn.functional.log_softmax(torch.permute(logits, (1, 0, 2)), 2)
+            pred = torch.nn.functional.log_softmax(logits, dim=2)
+            pred = pred.transpose(0, 1)
             pred = pred[:, 0, :]
 
         # decode using the greedy decoder
         # < fill your code here >
-        pred = greedy_decoder.forward(pred)
+        pred = greedy_decoder(pred)
 
         # convert to text
         out_text = ''.join([index2char[x] for x in pred])
@@ -385,7 +467,7 @@ def main():
     ## related to training
     parser.add_argument('--max_epoch', type=int, default=10, help='number of epochs during training')
     parser.add_argument('--batch_size', type=int, default=100, help='batch size')
-    parser.add_argument('--lr', type=int, default=1e-4, help='learning rate')
+    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
     parser.add_argument('--seed', type=int, default=2222, help='random seed initialisation')
 
     ## relating to loading and saving
@@ -398,6 +480,10 @@ def main():
     parser.add_argument('--server', dest='server', action='store_true', help='Server mode')
     parser.add_argument('--port', type=int, default=10000, help='Port for the server')
 
+    ## model
+    parser.add_argument('--model', type=str, default='convlstm', help='model type: convlstm, transformer')
+    parser.add_argument('--interval', type=int, default=10, help='interval to save and evaluate model')
+
     args = parser.parse_args()
 
     # device configuration
@@ -409,7 +495,11 @@ def main():
     char2index, index2char = load_label_json(args.labels_path)
 
     ## make an instance of the model on GPU
-    model = SpeechRecognitionModel(n_classes=len(char2index) + 1).cuda()
+    print("num classes:", len(char2index) + 1)
+    if args.model == 'convlstm':
+        model = SpeechRecognitionModel(n_classes=len(char2index) + 1).cuda()
+    elif args.model == 'transformer':
+        model = TransformerModel(ntoken=len(char2index) + 1, d_model=64, nhead=4, d_hid=512, nlayers=2, dropout=0.1).cuda()
     print('Model loaded. Number of parameters:', sum(p.numel() for p in model.parameters()))
 
     ## load from initial model
@@ -454,11 +544,16 @@ def main():
 
     ## define the optimizer with args.lr learning rate and appropriate weight decay
     # < fill your code here >
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = None
+    scheduler = None
+    if args.model == 'convlstm':
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    elif args.model == 'transformer':
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
 
     ## set loss function with blank index
     # < fill your code here >
-    criterion = torch.nn.CTCLoss(blank=10).cuda()
+    criterion = torch.nn.CTCLoss(blank=len(index2char)).cuda()
 
     ## initialise training log file
     f_log = open(os.path.join(args.log_path, 'train.log'), 'w')
@@ -479,10 +574,12 @@ def main():
 
         # save checkpoint to file
         # save at the last epoch
-        if epoch == args.max_epoch - 1:
+        if epoch == args.max_epoch - 1 or epoch % args.interval == 0:
             save_file = '{}/model{:05d}.pt'.format(args.log_path, epoch)
             print('Saving model {}'.format(save_file))
             torch.save(model.state_dict(), save_file)
+            print('Eval')
+            process_eval(model, args.val_path, args.val_list, index2char, save_path=args.log_path)
 
         # write training progress to log
         f_log.write('Epoch {:03d}, train loss {:.3f}, val loss {:.3f}\n'.format(epoch, tloss, vloss))
