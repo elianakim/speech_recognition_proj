@@ -78,6 +78,31 @@ class SpeechDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.data)
 
+class EvalSpeechDataset(torch.utils.data.Dataset):
+    def __init__(self, data_list, data_path, max_length):
+        super(EvalSpeechDataset, self).__init__()
+
+        # load data from JSON
+        with open(data_list, 'r') as f:
+            data = json.load(f)
+
+        # convert seconds to frames
+        max_length *= 16000
+
+        # sort data in length order and filter data less than max_length
+        data = sorted(data, key=lambda d: d['len'], reverse=True)
+        self.data = [x for x in data if x['len'] <= max_length]
+
+        self.dataset_path = data_path
+
+    def __getitem__(self, index):
+        data_path = os.path.join(self.dataset_path, self.data[index]['file'])
+        audio = soundfile.read(data_path)[0]
+
+        return torch.FloatTensor(audio)
+
+    def __len__(self):
+        return len(self.data)
 
 ## ===================================================================
 ## Define collate function
@@ -96,6 +121,10 @@ def pad_collate(batch):
 
     return xx_pad, yy_pad, x_lens, y_lens
 
+def eval_pad_collate(batch):
+    x_lens = [len(x) for x in batch]
+    xx_pad = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=0)  # < fill your code here >
+    return xx_pad, x_lens
 
 ## ===================================================================
 ## Define sampler 
@@ -123,6 +152,64 @@ class BucketingSampler(torch.utils.data.sampler.Sampler):
 
     def __len__(self):
         return len(self.bins)
+
+## ===================================================================
+## Test-Time Adaptation Modules
+## ===================================================================
+class TENT(nn.Module):
+    def __init__(self, model, optimizer, steps=1):
+        super().__init__()
+        self.model = model
+        self.optimizer = optimizer
+        self.steps = steps
+
+        # turn on grad for batch norm parameters only
+        self.model.train()
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        for module in self.model.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                # force use of batch stats in train and eval modes
+                module.track_running_stats = False
+                module.running_mean = None
+                module.running_var = None
+            module.weight.requires_grad_(True)
+            module.bias.requires_grad_(True)
+
+def configure_model(model):
+    # set train mode as tent optimizes the model to minimize entropy
+    model.train()
+    # disable grad
+    for param in model.parameters():
+        param.requires_grad = False
+    # turn on grad for batch norm parameters only
+    for module in model.modules():
+        if isinstance(module, nn.BatchNorm1d):
+            # force use of batch stats in train and eval modes
+            module.requires_grad_(True)
+            module.track_running_stats = False
+            module.running_mean = None
+            module.running_var = None
+    return model
+
+def softmax_entropy(x):
+    return -(x.softmax(2) * x.log_softmax(2)).sum(2)
+
+def collect_params(model):
+    # collect the affine scale + shift parameters from batch norms
+    # walk the model's modules and collect all batch normalization parameters
+    params = []
+    names = []
+    for nm, m in model.named_modules():
+        if isinstance(m, nn.BatchNorm1d):
+            for np, p in m.named_parameters():
+                if np in ['weight', 'bias']:
+                    params.append(p)
+                    names.append(f'{nm}.{np}')
+    return params, names
+
+
 
 ## ===================================================================
 ## Transformer-related functions and classes
@@ -354,17 +441,65 @@ class GreedyCTCDecoder(torch.nn.Module):
 ## Evaluation script
 ## ===================================================================
 
-def process_eval(model, data_path, data_list, index2char, save_path=None):
-    # set model to evaluation mode
-    model.eval()
+def process_eval(model, data_path, data_list, index2char, save_path=None, test_time_adaptation =False):
+    if test_time_adaptation:
+        # load model
+        model = configure_model(model)
+
+        # load data from JSON
+        with open(data_list, 'r') as f:
+            data = json.load(f)
+
+        # create dataloader for TENT
+        dataset = EvalSpeechDataset(data_list, data_path, 10)
+        loader = torch.utils.data.DataLoader(dataset,
+                                             batch_sampler=BucketingSampler(dataset, 100), # 100: batch size
+                                             num_workers=6,
+                                             collate_fn=eval_pad_collate)
+
+        # collect parameters
+        params, _ = collect_params(model)
+        optimizer = torch.optim.Adam(params, lr=1e-3, weight_decay=1e-5)
+
+        # adapt using entropy minimization
+        for epoch in range(0, 10):
+            ep_loss = 0
+            ep_cnt = 0
+            with tqdm(loader, unit="batch") as tepoch:
+                for audio in tepoch:
+                    x = audio[0].cuda()
+
+                    # add some noise to x
+                    x = x + torch.normal(mean=0, std=torch.std(x) * 1e-3, size=x.shape).cuda()
+                    logits = model(x)
+
+                    # adapt
+                    loss = softmax_entropy(logits).mean()
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    # loss calculate
+                    ep_loss += loss.detach() * len(x)
+                    ep_cnt += len(x)
+                    tepoch.set_postfix(loss=ep_loss.item() / ep_cnt)
+            print('Epoch {:03d}, loss: {:.3f}'.format(epoch, ep_loss.item() / ep_cnt))
+
+        # evaluate after training
+
+
+    else:
+        # set model to evaluation mode
+        model.eval()
+
+        # load data from JSON
+        with open(data_list, 'r') as f:
+            data = json.load(f)
+
+    # evaluate
 
     # initialise the greedy decoder
     greedy_decoder = GreedyCTCDecoder(blank=len(index2char))
-
-    # load data from JSON
-    with open(data_list, 'r') as f:
-        data = json.load(f)
-
     results = []
 
     for file in tqdm(data):
@@ -484,6 +619,7 @@ def main():
     ## model
     parser.add_argument('--model', type=str, default='convlstm', help='model type: convlstm, transformer')
     parser.add_argument('--interval', type=int, default=10, help='interval to save and evaluate model')
+    parser.add_argument('--tta', action='store_true', help='whether to do test time adaptation or not')
 
     args = parser.parse_args()
 
@@ -520,7 +656,7 @@ def main():
 
     ## code for inference - this uses val_path and val_list
     if args.eval:
-        process_eval(model, args.val_path, args.val_list, index2char, save_path=args.log_path)
+        process_eval(model, args.val_path, args.val_list, index2char, save_path=args.log_path, test_time_adaptation=args.tta)
         quit();
 
     # initialise seeds
