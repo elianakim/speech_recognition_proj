@@ -231,7 +231,7 @@ class SpeechRecognitionModel(nn.Module):
 
         ## define RNN layers as self.lstm - use a 3-layer bidirectional LSTM with 256 output size and 0.1 dropout
         # < fill your code here >
-        self.lstm = torch.nn.LSTM(input_size=64, hidden_size=256, dropout=0.1, num_layers=3, bidirectional=True)
+        self.lstm = torch.nn.LSTM(input_size=64, hidden_size=256, dropout=0.1, num_layers=3, bidirectional=True, batch_first=True)
 
         ## define the fully connected layer
         self.classifier = nn.Linear(512, n_classes)
@@ -291,7 +291,7 @@ def process_epoch(model, loader, criterion, optimizer, trainmode=True):
             x = x + torch.normal(mean=0, std=torch.std(x) * 1e-3, size=x.shape).cuda()
 
             # forward pass
-            logits = model.forward(x)
+            logits = model(x)
             output = torch.nn.functional.log_softmax(logits, dim=2)
             output = output.transpose(0, 1)
 
@@ -342,10 +342,10 @@ class GreedyCTCDecoder(torch.nn.Module):
         removed_repeats = torch.unique_consecutive(max_prob, dim=-1)
 
         # convert to numpy array
-        removed_repeats = removed_repeats.cpu().numpy()
+        removed_repeats = np.array(removed_repeats)
 
         # remove the blank symbols
-        indices = removed_repeats[removed_repeats != self.blank]
+        indices = [i for i in removed_repeats if i != self.blank]
 
         return indices
 
@@ -374,18 +374,19 @@ def process_eval(model, data_path, data_list, index2char, save_path=None):
         # < fill your code here >
         x = torch.FloatTensor(audio).cuda()
         x = x.unsqueeze(dim=0)
+        # add some noise
+        x = x + torch.normal(mean=0, std=torch.std(x) * 1e-3, size=x.shape).cuda()
 
         # forward pass through the model
         # < fill your code here >
         with torch.no_grad():
-            logits = model.forward(x)
+            logits = model(x)
             pred = torch.nn.functional.log_softmax(logits, dim=2)
             pred = pred.transpose(0, 1)
-            pred = pred[:, 0, :]
 
         # decode using the greedy decoder
         # < fill your code here >
-        pred = greedy_decoder(pred)
+        pred = greedy_decoder(pred.cpu().detach().squeeze())
 
         # convert to text
         out_text = ''.join([index2char[x] for x in pred])
@@ -499,7 +500,7 @@ def main():
     if args.model == 'convlstm':
         model = SpeechRecognitionModel(n_classes=len(char2index) + 1).cuda()
     elif args.model == 'transformer':
-        model = TransformerModel(ntoken=len(char2index) + 1, d_model=64, nhead=4, d_hid=512, nlayers=2, dropout=0.1).cuda()
+        model = TransformerModel(ntoken=len(char2index) + 1, d_model=64, nhead=2, d_hid=512, nlayers=2, dropout=0.1).cuda()
     print('Model loaded. Number of parameters:', sum(p.numel() for p in model.parameters()))
 
     ## load from initial model
@@ -546,10 +547,10 @@ def main():
     # < fill your code here >
     optimizer = None
     scheduler = None
-    if args.model == 'convlstm':
+    if args.model == 'convlstm' or args.model == 'transformer':
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    elif args.model == 'transformer':
-        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+    # elif args.model == 'transformer':
+    #     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
 
     ## set loss function with blank index
     # < fill your code here >
