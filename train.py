@@ -22,9 +22,7 @@ from einops.layers.torch import Rearrange
 
 device=None
 
-## ===================================================================
 ## Load labels
-## ===================================================================
 def load_label_json(labels_path):
     with open(labels_path, encoding="utf-8") as label_file:
         labels = json.load(label_file)
@@ -37,9 +35,7 @@ def load_label_json(labels_path):
 
         return char2index, index2char
 
-## ===================================================================
 ## Data loader
-## ===================================================================
 class SpeechDataset(torch.utils.data.Dataset):
     def __init__(self, data_list, data_path, max_length, char2index):
         super(SpeechDataset, self).__init__()
@@ -102,9 +98,7 @@ class EvalSpeechDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.data)
 
-## ===================================================================
 ## Define collate function
-## ===================================================================
 def pad_collate(batch):
     (xx, yy) = zip(*batch)
 
@@ -123,9 +117,7 @@ def eval_pad_collate(batch):
     xx_pad = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=0)  # < fill your code here >
     return xx_pad, x_lens
 
-## ===================================================================
-## Define sampler 
-## ===================================================================
+## Define sampler
 class BucketingSampler(torch.utils.data.sampler.Sampler):
     def __init__(self, data_source, batch_size=1):
         """
@@ -149,9 +141,7 @@ class BucketingSampler(torch.utils.data.sampler.Sampler):
     def __len__(self):
         return len(self.bins)
 
-## ===================================================================
 ## Test-Time Adaptation Modules
-## ===================================================================
 class TENT(nn.Module):
     def __init__(self, model, optimizer, steps=1):
         super().__init__()
@@ -215,10 +205,7 @@ def collect_params(model):
                     names.append(f'{nm}.{np}')
     return params, names
 
-## ===================================================================
-## Conformer
-## reference: https://github.com/lucidrains/conformer/blob/master/conformer/conformer.py
-## ===================================================================
+## Conformer | reference: https://github.com/lucidrains/conformer/blob/master/conformer/conformer.py, https://github.com/sooftware/conformer/blob/main/conformer
 # helper functions
 def exists(val):
     return val is not None
@@ -505,10 +492,7 @@ class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
             lr_factor *= epoch * 1.0 / self.warmup
         return lr_factor
 
-## ===================================================================
-## Transformer-related functions and classes
-## reference: https://pytorch.org/tutorials/beginner/transformer_tutorial.html
-## ===================================================================
+## Transformer-related functions and classes ## reference: https://pytorch.org/tutorials/beginner/transformer_tutorial.html
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout = 0.1, max_len = 5000):
         super().__init__()
@@ -581,9 +565,7 @@ class TransformerModel(nn.Module):
 
         return output
 
-## ===================================================================
 ## Baseline speech recognition model
-## ===================================================================
 class SpeechRecognitionModel(nn.Module):
     def __init__(self, n_classes=11):
         super(SpeechRecognitionModel, self).__init__()
@@ -632,10 +614,7 @@ class SpeechRecognitionModel(nn.Module):
 
         return class_out
 
-
-## ===================================================================
 ## Train an epoch on GPU
-## ===================================================================
 def process_epoch(model, loader, criterion, optimizer, trainmode=True):
     # Set the model to training or eval mode
     if trainmode:
@@ -644,7 +623,6 @@ def process_epoch(model, loader, criterion, optimizer, trainmode=True):
         model.eval()
 
     scheduler = CosineWarmupScheduler(optimizer=optimizer, warmup=100, max_iters=2700)
-
     ep_loss = 0
     ep_cnt = 0
 
@@ -670,7 +648,6 @@ def process_epoch(model, loader, criterion, optimizer, trainmode=True):
             if trainmode:
                 # backward pass
                 loss.backward()
-
                 # optimizer step
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) # prevent gradient exploding
                 optimizer.step()
@@ -686,10 +663,7 @@ def process_epoch(model, loader, criterion, optimizer, trainmode=True):
 
     return ep_loss.item() / ep_cnt
 
-
-## ===================================================================
 ## Greedy CTC Decoder
-## ===================================================================
 class GreedyCTCDecoder(torch.nn.Module):
     def __init__(self, blank=0):
         super().__init__()
@@ -701,22 +675,16 @@ class GreedyCTCDecoder(torch.nn.Module):
         """
         # find the index of the maximum probability output at each time step
         max_prob = torch.argmax(emission, dim=-1)
-
         # remove the repeats
         removed_repeats = torch.unique_consecutive(max_prob, dim=-1)
-
         # convert to numpy array
         removed_repeats = np.array(removed_repeats)
-
         # remove the blank symbols
         indices = [i for i in removed_repeats if i != self.blank]
 
         return indices
 
-
-## ===================================================================
 ## Evaluation script
-## ===================================================================
 def process_eval(model, data_path, data_list, index2char, save_path=None, test_time_adaptation =False):
     if test_time_adaptation:
         # load model
@@ -798,19 +766,15 @@ def process_eval(model, data_path, data_list, index2char, save_path=None, test_t
         x = x.unsqueeze(dim=0)
         # add some noise
         x = x + torch.normal(mean=0, std=torch.std(x) * 1e-3, size=x.shape).cuda()
-
         # forward pass through the model
         with torch.no_grad():
             logits = model(x)
             pred = torch.nn.functional.log_softmax(logits, dim=2)
             pred = pred.transpose(0, 1)
-
         # decode using the greedy decoder
         pred = greedy_decoder(pred.cpu().detach().squeeze())
-
         # convert to text
         out_text = ''.join([index2char[x] for x in pred])
-
         # keep log of the results
         file['pred'] = out_text
         if 'text' in file:
@@ -821,15 +785,12 @@ def process_eval(model, data_path, data_list, index2char, save_path=None, test_t
     # save results to json file
     with open(os.path.join(save_path, 'results.json'), 'w', encoding='utf-8') as outfile:
         json.dump(results, outfile, ensure_ascii=False, indent=2)
-
     # print CER if there is ground truth
     if 'text' in file:
         cer = sum([x['edit_dist'] for x in results]) / sum([x['gt_len'] for x in results])
         print('Character Error Rate is {:.2f}%'.format(cer * 100))
 
-## ===================================================================
 ## Deploy server script
-## ===================================================================
 def deploy_server(model, index2char, port):
     # initialise the greedy decoder
     greedy_decoder = GreedyCTCDecoder(blank=len(index2char))
@@ -860,9 +821,7 @@ def deploy_server(model, index2char, port):
 
     app.run(host='0.0.0.0', debug=True, port=port, threaded=False)
 
-## ===================================================================
 ## Main execution script
-## ===================================================================
 def main():
     parser = argparse.ArgumentParser(description='EE738 Exercise')
 
@@ -999,3 +958,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# example arguments
+# python train.py --gpu_idx 6 --interval 1 --log_suffix conformer_debug --lr 0.005 --max_epoch 10 --model conformer --seed 0 --train_list ./datasets/ksponspeech/kspon_train.json --train_path ./datasets/ksponspeech --batch_size 20
+# python train.py --eval --tta --log_suffix test --seed 0 --gpu_idx 3
