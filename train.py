@@ -421,6 +421,11 @@ class ConformerEncoder(nn.Module):
     def __init__(self, input_dim, encoder_dim, num_layers, num_attention_heads, ff_mult, conv_expansion_factor,
                  conv_kernel_size, input_dropout, attn_dropout, ff_dropout, conv_dropout):
         super(ConformerEncoder, self).__init__()
+        self.conv_subsample = Conv2dSubsampling(in_channels=1, out_channels=encoder_dim)
+        self.input_projection = nn.Sequential(
+            nn.Linear(encoder_dim * (((input_dim - 1) // 2 - 1) // 2), encoder_dim),
+            nn.Dropout(p = input_dropout)
+        )
         self.layers = nn.ModuleList([ConformerBlock(dim=encoder_dim, heads = num_attention_heads, dim_head= int(encoder_dim/num_attention_heads),
                                                     ff_mult=ff_mult, conv_expansion_factor=conv_expansion_factor, conv_kernel_size=conv_kernel_size,
                                                     attn_dropout=attn_dropout, ff_dropout=ff_dropout, conv_dropout=conv_dropout) for _ in range(num_layers)])
