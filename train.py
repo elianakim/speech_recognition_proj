@@ -980,12 +980,11 @@ def main():
 
         # save checkpoint to file # save at the last epoch
         if epoch == args.max_epoch - 1 or epoch % args.interval == 0:
-            if epoch == 0: continue
+            if epoch == 0:
+                continue
             save_file = '{}/model{:05d}.pt'.format(args.log_path, epoch)
             print('Saving model {}'.format(save_file))
             torch.save(model.state_dict(), save_file)
-            print('Eval')
-            process_eval(model, args.val_path, args.val_list, index2char, save_path=args.log_path)
 
         # write training progress to log
         f_log.write('Epoch {:03d}, train loss {:.3f}, val loss {:.3f}\n'.format(epoch, tloss, vloss))
